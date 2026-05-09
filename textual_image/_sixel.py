@@ -117,10 +117,7 @@ def image_to_sixels(
     image, alpha_mask = _prepare_image(image, options, background)
     raw_data = image.tobytes()
 
-    if _HAS_NUMPY:
-        data, color_registers = _compact_palette_np(image, raw_data, alpha_mask)
-    else:
-        data, color_registers = _compact_palette(image, raw_data, alpha_mask)
+    data, color_registers = _compact_palette(image, raw_data, alpha_mask)
 
     if options.lazy_color_palette:
         tracker: _ColorTracker = _LazyColorTracker(color_registers)
@@ -129,10 +126,7 @@ def image_to_sixels(
         tracker = _PaletteColorTracker()
         palette_prefix = b"".join(color_registers)
 
-    if _HAS_NUMPY:
-        chunks = _iter_bands_np(data, image.width, image.height, tracker, alpha_mask)
-    else:
-        chunks = _iter_bands(data, image.width, image.height, tracker, alpha_mask)
+    chunks = _iter_bands(data, image.width, image.height, tracker, alpha_mask)
 
     header = _make_header(image.width, image.height, transparent=alpha_mask is not None)
     return (header + palette_prefix + b"".join(chunks) + _ST).decode("ascii")
@@ -227,25 +221,55 @@ def _visible_color_counts(data: bytes, alpha_mask: AlphaMask) -> dict[int, int]:
 
     return dict(Counter(color for color, alpha in zip(data, alpha_mask, strict=True) if alpha))
 
+if _HAS_NUMPY:
+    def _compact_palette(
+        image: PILImage.Image,
+        data: bytes,
+        alpha_mask: AlphaMask = None,
+    ) -> tuple[bytes, tuple[bytes, ...]]:
+        """Numpy-accelerated palette compaction using ``np.bincount``."""
+        palette = image.getpalette() or []
+        arr = np.frombuffer(data, dtype=np.uint8)
+        visible_arr = arr if alpha_mask is None else arr[np.frombuffer(alpha_mask, dtype=np.uint8) != 0]
+        counts_arr = np.bincount(visible_arr, minlength=MAX_COLORS)
 
-def _compact_palette(
-    image: PILImage.Image,
-    data: bytes,
-    alpha_mask: AlphaMask = None,
-) -> tuple[bytes, tuple[bytes, ...]]:
-    """Deduplicate palette entries that round to the same sixel RGB percentage.
+        index_freq = {int(i): int(counts_arr[i]) for i in np.flatnonzero(counts_arr)}
+        remap_dict, registers = _build_palette_map(palette, index_freq)
 
-    and remap indices so the most frequent colours get the smallest numbers.
-    """
-    palette = image.getpalette() or []
-    index_freq = _visible_color_counts(data, alpha_mask)
-    remap, registers = _build_palette_map(palette, index_freq)
+        remap = np.zeros(MAX_COLORS, dtype=np.uint8)
+        for idx, new_idx in remap_dict.items():
+            remap[idx] = new_idx
 
-    table = bytearray(MAX_COLORS)
-    for idx, new_idx in remap.items():
-        table[idx] = new_idx
+        return remap[arr].tobytes(), registers
+    
+    _compact_palette_np = _compact_palette # for backwards compatibility
+else:
+    def _compact_palette(
+        image: PILImage.Image,
+        data: bytes,
+        alpha_mask: AlphaMask = None,
+    ) -> tuple[bytes, tuple[bytes, ...]]:
+        """Deduplicate palette entries that round to the same sixel RGB percentage.
 
-    return data.translate(bytes(table)), registers
+        and remap indices so the most frequent colours get the smallest numbers.
+        """
+        palette = image.getpalette() or []
+        index_freq = _visible_color_counts(data, alpha_mask)
+        remap, registers = _build_palette_map(palette, index_freq)
+
+        table = bytearray(MAX_COLORS)
+        for idx, new_idx in remap.items():
+            table[idx] = new_idx
+
+        return data.translate(bytes(table)), registers
+    
+    def _compact_palette_np( # for backwards compatibility
+        image: PILImage.Image,
+        data: bytes,
+        alpha_mask: AlphaMask = None,
+    ) -> tuple[bytes, tuple[bytes, ...]]:
+        """Fallback to the pure-Python palette compactor when NumPy is unavailable."""
+        return _compact_palette(image, data, alpha_mask)
 
 
 def _make_header(width: int, height: int, transparent: bool = False) -> bytes:
@@ -468,73 +492,11 @@ def _emit_band(
     buffer.append(_NL)
     return buffer
 
-
-def _iter_bands(
-    data: bytes,
-    width: int,
-    height: int,
-    tracker: _ColorTracker,
-    alpha_mask: AlphaMask = None,
-) -> list[AnyBytes]:
-    """Return encoded sixel chunks, one per band."""
-    band_data = [bytearray(width) for _ in range(MAX_COLORS)]
-    zero_fill = bytes(width)
-    allow_fill = alpha_mask is None
-
-    bands: list[AnyBytes] = []
-    for band_y in range(0, height, _BAND_HEIGHT):
-        band_h = min(_BAND_HEIGHT, height - band_y)
-        spans = _pack_band(data, band_y, band_h, width, band_data, alpha_mask)
-        bands.append(_emit_band(spans, band_data, tracker, band_h, allow_fill=allow_fill))
-
-        for c in spans:
-            band_data[c][:] = zero_fill
-
-    return bands
-
-
-def _rle_prefix(n: int) -> bytes:
-    return _RLE_PREFIX[n] if n < _CACHED_COUNTS else f"!{n}".encode("ascii")
-
-
-def _compress_long_run(match: re.Match[bytes]) -> bytes:
-    """``re.sub`` callback: compress a run of 4+ identical bytes to ``!N<char>``."""
-    n = match.end() - match.start()
-    return _rle_prefix(n) + match.group(1)
-
-
-def _rle_encode(data: bytearray, start: int, end: int) -> AnyBytes:
-    """RLE-encode ``data[start:end]`` with the +0x3F sixel offset applied."""
-    if segment := data[start:end].translate(_TRANSLATE_TABLE):
-        return _LONG_RUN_RE.sub(_compress_long_run, segment)
-    return b""  # pragma: no cover
-
-
 if _HAS_NUMPY:
     # Bit weights for the 6 rows in a sixel band: [1, 2, 4, 8, 16, 32]
     _NP_BIT_WEIGHTS = np.array([1 << r for r in range(_BAND_HEIGHT)], dtype=np.uint8)
 
-    def _compact_palette_np(
-        image: PILImage.Image,
-        data: bytes,
-        alpha_mask: AlphaMask = None,
-    ) -> tuple[bytes, tuple[bytes, ...]]:
-        """Numpy-accelerated palette compaction using ``np.bincount``."""
-        palette = image.getpalette() or []
-        arr = np.frombuffer(data, dtype=np.uint8)
-        visible_arr = arr if alpha_mask is None else arr[np.frombuffer(alpha_mask, dtype=np.uint8) != 0]
-        counts_arr = np.bincount(visible_arr, minlength=MAX_COLORS)
-
-        index_freq = {int(i): int(counts_arr[i]) for i in np.flatnonzero(counts_arr)}
-        remap_dict, registers = _build_palette_map(palette, index_freq)
-
-        remap = np.zeros(MAX_COLORS, dtype=np.uint8)
-        for idx, new_idx in remap_dict.items():
-            remap[idx] = new_idx
-
-        return remap[arr].tobytes(), registers
-
-    def _iter_bands_np(
+    def _iter_bands(
         data: bytes,
         width: int,
         height: int,
@@ -606,18 +568,33 @@ if _HAS_NUMPY:
             bitmask[active_colors] = 0
 
         return bands
-
-else:  # pragma: no cover
-
-    def _compact_palette_np(
-        image: PILImage.Image,
+    
+    _iter_bands_np = _iter_bands # for backwards compatibility
+else:
+    def _iter_bands(
         data: bytes,
+        width: int,
+        height: int,
+        tracker: _ColorTracker,
         alpha_mask: AlphaMask = None,
-    ) -> tuple[bytes, tuple[bytes, ...]]:
-        """Fallback to the pure-Python palette compactor when NumPy is unavailable."""
-        return _compact_palette(image, data, alpha_mask)
+    ) -> list[AnyBytes]:
+        """Return encoded sixel chunks, one per band."""
+        band_data = [bytearray(width) for _ in range(MAX_COLORS)]
+        zero_fill = bytes(width)
+        allow_fill = alpha_mask is None
 
-    def _iter_bands_np(
+        bands: list[AnyBytes] = []
+        for band_y in range(0, height, _BAND_HEIGHT):
+            band_h = min(_BAND_HEIGHT, height - band_y)
+            spans = _pack_band(data, band_y, band_h, width, band_data, alpha_mask)
+            bands.append(_emit_band(spans, band_data, tracker, band_h, allow_fill=allow_fill))
+
+            for c in spans:
+                band_data[c][:] = zero_fill
+
+        return bands
+    
+    def _iter_bands_np( # for backwards compatibility
         data: bytes,
         width: int,
         height: int,
@@ -626,3 +603,20 @@ else:  # pragma: no cover
     ) -> list[AnyBytes]:
         """Fallback to the pure-Python band iterator when NumPy is unavailable."""
         return _iter_bands(data, width, height, tracker, alpha_mask)
+
+
+def _rle_prefix(n: int) -> bytes:
+    return _RLE_PREFIX[n] if n < _CACHED_COUNTS else f"!{n}".encode("ascii")
+
+
+def _compress_long_run(match: re.Match[bytes]) -> bytes:
+    """``re.sub`` callback: compress a run of 4+ identical bytes to ``!N<char>``."""
+    n = match.end() - match.start()
+    return _rle_prefix(n) + match.group(1)
+
+
+def _rle_encode(data: bytearray, start: int, end: int) -> AnyBytes:
+    """RLE-encode ``data[start:end]`` with the +0x3F sixel offset applied."""
+    if segment := data[start:end].translate(_TRANSLATE_TABLE):
+        return _LONG_RUN_RE.sub(_compress_long_run, segment)
+    return b""  # pragma: no cover
